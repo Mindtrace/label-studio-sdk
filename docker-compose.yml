@@ -1,64 +1,139 @@
 version: "3.9"
 services:
-  nginx:
-    build: .
-    image: heartexlabs/label-studio:latest
-    restart: unless-stopped
-    ports:
-      - "8080:8085"
-      - "8081:8086"
-    depends_on:
-      - app
-    environment:
-      - LABEL_STUDIO_HOST=${LABEL_STUDIO_HOST:-}
-    #   Optional: Specify SSL termination certificate & key
-    #   Just drop your cert.pem and cert.key into folder 'deploy/nginx/certs'
-    #      - NGINX_SSL_CERT=/certs/cert.pem
-    #      - NGINX_SSL_CERT_KEY=/certs/cert.key
-    volumes:
-      - ./mydata:/label-studio/data:rw
-      - ./deploy/nginx/certs:/certs:ro
-    #   Optional: Override nginx default conf
-    #      - ./deploy/my.conf:/etc/nginx/nginx.conf
-    command: nginx
+ # Main web server handling HTTP requests
+ nginx:
+   image: heartexlabs/label-studio:latest
+   restart: unless-stopped
+   user: root
+   ports:
+     - "8080:8085"  # External:Internal port mapping
+   depends_on:
+     app:
+       condition: service_healthy
+   environment:
+     - LABEL_STUDIO_HOST=${LABEL_STUDIO_HOST}  # Server hostname configuration
+   volumes:
+     - ./mydata:/label-studio/data:rw  # Persistent data storage
+     - ./label-studio/web/libs/editor/src/core/settings/keymap.json:/label-studio/label_studio/frontend/dist/dm/static/editor/keymap.json:ro
+   command: nginx
+   networks:
+     - default
+   logging:
+     driver: "json-file"
+     options:
+       max-size: "10m"
+       max-file: "3"
 
-  app:
-    stdin_open: true
-    tty: true
-    build: .
-    image: heartexlabs/label-studio:latest
-    restart: unless-stopped
-    expose:
-      - "8000"
-    depends_on:
-      - db
-    environment:
-      - DJANGO_DB=default
-      - POSTGRE_NAME=postgres
-      - POSTGRE_USER=postgres
-      - POSTGRE_PASSWORD=
-      - POSTGRE_PORT=5432
-      - POSTGRE_HOST=db
-      - LABEL_STUDIO_HOST=${LABEL_STUDIO_HOST:-}
-      - JSON_LOG=1
-    #      - LOG_LEVEL=DEBUG
-    volumes:
-      - ./mydata:/label-studio/data:rw
-    command: label-studio-uwsgi
+ # Main application server running Label Studio
+ app:
+   image: heartexlabs/label-studio:latest
+   restart: unless-stopped
+   user: root
+   expose:
+     - "8000"  # Internal port for nginx communication
+   depends_on:
+     db:
+       condition: service_healthy
+     redis:
+       condition: service_healthy
+   environment:
+     # Database connection settings
+     - DJANGO_DB=default
+     - POSTGRE_NAME=labelstudio
+     - POSTGRE_USER=labelstudio_user
+     - POSTGRE_PASSWORD=${POSTGRES_PASSWORD}
+     - POSTGRE_PORT=5432
+     - POSTGRE_HOST=db
+     
+     # Application settings
+     - LABEL_STUDIO_HOST=${LABEL_STUDIO_HOST}
+     - JSON_LOG=1
+     - LABEL_STUDIO_LOG_LEVEL=INFO
+     - DJANGO_LOG_LEVEL=INFO
+     
+     # UWSGI settings - optimized for 8 CPU cores
+     - UWSGI_HARAKIRI=1200        # Worker timeout in seconds
+     - UWSGI_WORKER_RELOAD_MERCY=1200
+     - UWSGI_PROCESSES=8          # Match CPU cores
+     - UWSGI_THREADS=4            # Threads per process
+   volumes:
+     - ./mydata:/label-studio/data:rw  # Persistent data storage
+     - ./label-studio/web/libs/editor/src/core/settings/keymap.json:/label-studio/label_studio/frontend/dist/dm/static/editor/keymap.json:ro
+   command: label-studio-uwsgi
+   networks:
+     - default
+   healthcheck:
+     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+     interval: 30s
+     timeout: 10s
+     retries: 5
+   logging:
+     driver: "json-file"
+     options:
+       max-size: "10m"
+       max-file: "3"
 
-  db:
-    image: pgautoupgrade/pgautoupgrade:13-alpine
-    hostname: db
-    restart: unless-stopped
-    # Optional: Enable TLS on PostgreSQL
-    # Just drop your server.crt and server.key into folder 'deploy/pgsql/certs'
-    # NOTE: Both files must have permissions u=rw (0600) or less
-    #    command: >
-    #      -c ssl=on
-    #      -c ssl_cert_file=/var/lib/postgresql/certs/server.crt
-    #      -c ssl_key_file=/var/lib/postgresql/certs/server.key
-    environment:
-      - POSTGRES_HOST_AUTH_METHOD=trust
-    volumes:
-      - ${POSTGRES_DATA_DIR:-./postgres-data}:/var/lib/postgresql/data
-      - ./deploy/pgsql/certs:/var/lib/postgresql/certs:ro
+ # PostgreSQL database for storing annotations and metadata
+ db:
+   image: pgautoupgrade/pgautoupgrade:13-alpine
+   hostname: db
+   restart: unless-stopped
+   environment:
+     - POSTGRES_DB=labelstudio
+     - POSTGRES_USER=labelstudio_user
+     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+     - POSTGRESQL_HOST_AUTH_METHOD=scram-sha-256
+   volumes:
+     - postgres-data:/var/lib/postgresql/data  # Persistent database storage
+     - ./postgresql-config/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+     - ./postgresql-config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+   command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql/pg_hba.conf
+   networks:
+     - default
+   healthcheck:
+     test: ["CMD-SHELL", "pg_isready -U labelstudio_user -d labelstudio"]
+     interval: 30s
+     timeout: 10s
+     retries: 5
+   logging:
+     driver: "json-file"
+     options:
+       max-size: "10m"
+       max-file: "3"
+
+ # Redis for caching and improving application performance
+ redis:
+   image: redis:6.0.7
+   hostname: redis
+   restart: unless-stopped
+   command: >
+     redis-server 
+     --maxmemory 16gb          
+     --maxmemory-policy allkeys-lru  
+     --requirepass ${REDIS_PASSWORD}  
+     --io-threads 4             
+     --io-threads-do-reads yes  
+   volumes:
+     - redis-data:/data  # Persistent cache storage
+   networks:
+     - default
+   healthcheck:
+     test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+     interval: 30s
+     timeout: 10s
+     retries: 5
+   logging:
+     driver: "json-file"
+     options:
+       max-size: "10m"
+       max-file: "3"
+
+# Persistent storage volumes
+volumes:
+ redis-data:    # Persistent Redis cache data
+ postgres-data: # Persistent PostgreSQL data
+
+# Network configuration
+networks:
+ default:
+   driver: bridge  # Standard bridge network for container communication
